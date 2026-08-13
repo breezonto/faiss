@@ -10,11 +10,11 @@ This repository retains all applicable copyright and license notices from the up
 
 Refers to [official guide](./INSTALL.md). Briefly, below are necessary dependencies for building targets _faiss_, _swigfaiss_ and _python package_:
 
-- OpenBLAS
+- OpenBLAS: an open-source implementation of the BLAS (Basic Linear Algebra Subprograms) and LAPACK APIs, which provide highly optimized low-level routines for numerical linear algebra operations.
 
-- Swig
+- Swig: a tool that automatically generates language bindings between C/C++ code and high-level languages such as Python.
 
-- gflags
+- gflags: a C++ library for defining and parsing command-line arguments.a C++ library for defining and parsing command-line arguments.
 
 ```
 sudo apt update
