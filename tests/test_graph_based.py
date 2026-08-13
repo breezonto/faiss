@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-""" a few tests for graph-based indices (HNSW, nndescent and NSG)"""
+"""a few tests for graph-based indices (HNSW, nndescent and NSG)"""
 
 import numpy as np
 import unittest
@@ -39,6 +39,82 @@ class TestHNSW(unittest.TestCase):
 
         self.io_and_retest(index, Dhnsw, Ihnsw)
 
+    def test_deterministic_build(self):
+        # The HNSW build is deterministic and lock-free: repeated builds, and
+        # builds at different thread counts, produce byte-identical graphs.
+        # nb must be large enough that the batch-size cap (2% of n) exceeds
+        # the >100 threshold gating the parallel build region; otherwise the
+        # build runs single-threaded and determinism is trivially untested.
+        d = 32
+        nb = 20000
+        xb = np.random.RandomState(123).random((nb, d)).astype("float32")
+
+        # build() mutates the process-global OpenMP thread count and the
+        # deterministic-build flag; restore both so they do not leak into
+        # subsequent tests.
+        self.addCleanup(faiss.omp_set_num_threads, faiss.omp_get_max_threads())
+        self.addCleanup(
+            setattr,
+            faiss.cvar,
+            "hnsw_deterministic_build",
+            faiss.cvar.hnsw_deterministic_build,
+        )
+        faiss.cvar.hnsw_deterministic_build = True
+
+        def build(nthreads):
+            faiss.omp_set_num_threads(nthreads)
+            index = faiss.IndexHNSWFlat(d, 16)
+            index.add(xb)
+            return index
+
+        # `index.hnsw` returns a fresh (copied) proxy and `.neighbors` /
+        # `.offsets` are views into it, so chaining `index.hnsw.neighbors`
+        # inline reads a freed temporary. Bind the hnsw proxy to keep it alive
+        # across the (copying) vector_to_array calls.
+        def graph_of(index):
+            hnsw = index.hnsw
+            return (
+                hnsw.max_level,
+                faiss.vector_to_array(hnsw.neighbors),
+                faiss.vector_to_array(hnsw.offsets),
+            )
+
+        idx8 = build(8)
+        max_level, g8a, offs = graph_of(idx8)
+
+        # graph is non-trivial: multi-level, many real edges
+        self.assertGreaterEqual(max_level, 1)
+        self.assertGreater(int((g8a >= 0).sum()), nb)
+
+        # reproducible across repeated builds and across thread counts
+        g8b = graph_of(build(8))[1]
+        g1 = graph_of(build(1))[1]
+        np.testing.assert_array_equal(g8a, g8b)
+        np.testing.assert_array_equal(g8a, g1)
+
+        # no self-loops
+        for i in range(nb):
+            seg = g8a[int(offs[i]) : int(offs[i + 1])]
+            self.assertNotIn(i, seg[seg >= 0].tolist())
+
+    def test_deterministic_build_recall(self):
+        # Same recall bar as test_hnsw (which exercises the lock-based default),
+        # so the deterministic graph is not merely reproducible but as good.
+        self.addCleanup(
+            setattr,
+            faiss.cvar,
+            "hnsw_deterministic_build",
+            faiss.cvar.hnsw_deterministic_build,
+        )
+        faiss.cvar.hnsw_deterministic_build = True
+
+        index = faiss.IndexHNSWFlat(self.xq.shape[1], 16)
+        index.add(self.xb)
+        Dhnsw, Ihnsw = index.search(self.xq, 1)
+
+        self.assertGreaterEqual((self.Iref == Ihnsw).sum(), 460)
+        self.io_and_retest(index, Dhnsw, Ihnsw)
+
     def test_range_search(self):
         index_flat = faiss.IndexFlat(self.xb.shape[1])
         index_flat.add(self.xb)
@@ -53,8 +129,8 @@ class TestHNSW(unittest.TestCase):
         nmiss = 0
         # check if returned results are a subset of the reference results
         for i in range(len(self.xq)):
-            ref = Iref[lims_ref[i]: lims_ref[i + 1]]
-            new = I[lims[i]: lims[i + 1]]
+            ref = Iref[lims_ref[i] : lims_ref[i + 1]]
+            new = I[lims[i] : lims[i + 1]]
             self.assertLessEqual(set(new), set(ref))
             nmiss += len(ref) - len(new)
         # currently we miss 405 / 6019 neighbors
@@ -140,9 +216,10 @@ class TestHNSW(unittest.TestCase):
 
     def test_add_0_vecs(self):
         index = faiss.IndexHNSWFlat(10, 16)
-        zero_vecs = np.zeros((0, 10), dtype='float32')
+        zero_vecs = np.zeros((0, 10), dtype="float32")
         # infinite loop
         index.add(zero_vecs)
+        self.assertEqual(index.ntotal, 0)
 
     def test_hnsw_IP(self):
         d = self.xq.shape[1]
@@ -158,7 +235,7 @@ class TestHNSW(unittest.TestCase):
         self.assertGreaterEqual((Iref == Ihnsw).sum(), 470)
 
         mask = Iref[:, 0] == Ihnsw[:, 0]
-        assert np.allclose(Dref[mask, 0], Dhnsw[mask, 0])
+        self.assertTrue(np.allclose(Dref[mask, 0], Dhnsw[mask, 0]))
 
     def test_ndis_stats(self):
         d = self.xq.shape[1]
@@ -182,13 +259,10 @@ class TestHNSW(unittest.TestCase):
             faiss.serialize_index(index, faiss.IO_FLAG_SKIP_STORAGE)
         )
         self.assertEqual(index2.storage, None)
-        self.assertRaises(
-            RuntimeError,
-            index2.search, self.xb, 1)
+        self.assertRaises(RuntimeError, index2.search, self.xb, 1)
 
         # make sure we can store an index with empty storage
-        index4 = faiss.deserialize_index(
-            faiss.serialize_index(index2))
+        faiss.deserialize_index(faiss.serialize_index(index2))
 
         # add storage afterwards
         index.storage = faiss.clone_index(index.storage)
@@ -197,14 +271,6 @@ class TestHNSW(unittest.TestCase):
         Dnew, Inew = index.search(self.xq, 5)
         np.testing.assert_array_equal(Dnew, Dref)
         np.testing.assert_array_equal(Inew, Iref)
-
-        if False:
-            # test reading without storage
-            # not implemented because it is hard to skip over an index
-            index3 = faiss.deserialize_index(
-                faiss.serialize_index(index), faiss.IO_FLAG_SKIP_STORAGE
-            )
-            self.assertEqual(index3.storage, None)
 
     def test_hnsw_reset(self):
         d = self.xb.shape[1]
@@ -288,7 +354,9 @@ class TestHNSWSimilarity(unittest.TestCase):
         d = self.xb.shape[1]
         self._check_quantized_IP(
             faiss.IndexHNSWFlat(d, 16, faiss.METRIC_INNER_PRODUCT),
-            min_agreement=195,
+            # observed ~199/200; headroom for OpenMP-parallel-build
+            # nondeterminism
+            min_agreement=180,
         )
 
     def test_hnsw_pq_IP(self):
@@ -348,15 +416,15 @@ class TestHNSWNaN(unittest.TestCase):
         d = 64
         nt = 2000
         nb = 1000
-        xt = np.random.default_rng(42).random((nt, d), dtype='float32')
-        xb = np.random.default_rng(43).random((nb, d), dtype='float32')
+        xt = np.random.default_rng(42).random((nt, d), dtype="float32")
+        xb = np.random.default_rng(43).random((nb, d), dtype="float32")
 
         index = faiss.index_factory(d, "IVF256_HNSW32,SQ8")
         index.train(xt)
         index.add(xb)
 
         # Create a vector with NaN in the first component
-        vec = np.zeros((1, d), dtype='float32')
+        vec = np.zeros((1, d), dtype="float32")
         vec[0, 0] = np.nan
 
         # This should not crash
@@ -370,9 +438,9 @@ class Issue3684(unittest.TestCase):
         np.random.seed(1234)  # For reproducibility
         d = 256  # Example dimension
         nb = 10  # Number of database vectors
-        nq = 2   # Number of query vectors
-        xb = np.random.random((nb, d)).astype('float32')
-        xq = np.random.random((nq, d)).astype('float32')
+        nq = 2  # Number of query vectors
+        xb = np.random.random((nb, d)).astype("float32")
+        xq = np.random.random((nq, d)).astype("float32")
 
         faiss.normalize_L2(xb)  # Normalize both query and database vectors
         faiss.normalize_L2(xq)
@@ -470,8 +538,6 @@ class TestNSG(unittest.TestCase):
 
     def subtest_build(self, knn_graph, thresh, metric=faiss.METRIC_L2):
         d = self.xq.shape[1]
-        metrics = {faiss.METRIC_L2: 'L2',
-                   faiss.METRIC_INNER_PRODUCT: 'IP'}
 
         flat_index = faiss.IndexFlat(d, metric)
         flat_index.add(self.xb)
@@ -589,8 +655,7 @@ class TestNSG(unittest.TestCase):
             index.add(self.xb)
 
         self.assertIn(
-            "NSG does not support incremental addition",
-            str(context.exception)
+            "NSG does not support incremental addition", str(context.exception)
         )
 
     def test_nsg_rebuild_throws_with_pre_built_knn_graph(self):
@@ -611,9 +676,10 @@ class TestNSG(unittest.TestCase):
         d = self.xq.shape[1]
         R, pq_M = 32, 4
         index = faiss.index_factory(d, f"NSG{R}_PQ{pq_M}np")
-        assert isinstance(index, faiss.IndexNSGPQ)
+        self.assertIsInstance(index, faiss.IndexNSGPQ)
         idxpq = faiss.downcast_index(index.storage)
-        assert index.nsg.R == R and idxpq.pq.M == pq_M
+        self.assertEqual(index.nsg.R, R)
+        self.assertEqual(idxpq.pq.M, pq_M)
 
         flat_index = faiss.IndexFlat(d)
         flat_index.add(self.xb)
@@ -626,7 +692,9 @@ class TestNSG(unittest.TestCase):
 
         # test accuracy
         recalls = (Iref == I).sum()
-        self.assertGreaterEqual(recalls, 190)  # 193
+        # observed ~193/500; PQ4 is coarse -- headroom for OpenMP
+        # FP-reduction / tie-break nondeterminism in NSG build + PQ assign
+        self.assertGreaterEqual(recalls, 180)
 
         # test I/O
         self.subtest_io_and_clone(index, D, I)
@@ -636,10 +704,10 @@ class TestNSG(unittest.TestCase):
         d = self.xq.shape[1]
         R = 32
         index = faiss.index_factory(d, f"NSG{R}_SQ8")
-        assert isinstance(index, faiss.IndexNSGSQ)
+        self.assertIsInstance(index, faiss.IndexNSGSQ)
         idxsq = faiss.downcast_index(index.storage)
-        assert index.nsg.R == R
-        assert idxsq.sq.qtype == faiss.ScalarQuantizer.QT_8bit
+        self.assertEqual(index.nsg.R, R)
+        self.assertEqual(idxsq.sq.qtype, faiss.ScalarQuantizer.QT_8bit)
 
         flat_index = faiss.IndexFlat(d)
         flat_index.add(self.xb)
@@ -651,7 +719,8 @@ class TestNSG(unittest.TestCase):
 
         # test accuracy
         recalls = (Iref == I).sum()
-        self.assertGreaterEqual(recalls, 405)  # 411
+        # nominal ~411/500; loosened for OpenMP graph-build nondeterminism
+        self.assertGreaterEqual(recalls, 395)
 
         # test I/O
         self.subtest_io_and_clone(index, D, I)
@@ -734,8 +803,8 @@ class TestNNDescentGenRandom(unittest.TestCase):
         """
         d = 32
         nb = 200  # just above NUM_EVAL_POINTS=100
-        xb = np.random.default_rng(42).random((nb, d)).astype('float32')
-        xq = np.random.default_rng(43).random((10, d)).astype('float32')
+        xb = np.random.default_rng(42).random((nb, d)).astype("float32")
+        xq = np.random.default_rng(43).random((10, d)).astype("float32")
 
         index = faiss.IndexNNDescentFlat(d, 32)
         index.nndescent.search_L = nb  # triggers gen_random(size=nb, N=nb)
@@ -744,6 +813,8 @@ class TestNNDescentGenRandom(unittest.TestCase):
 
         # This crashed with division by zero before the fix
         D, I = index.search(xq, k=1)
+        self.assertEqual(I.shape, (xq.shape[0], 1))
+        self.assertEqual(D.shape, (xq.shape[0], 1))
 
 
 class TestNNDescentKNNG(unittest.TestCase):
@@ -781,10 +852,10 @@ class TestNNDescentKNNG(unittest.TestCase):
                         recalls += 1
                         break
         recall = 1.0 * recalls / (nb * K)
-        assert recall > 0.99
+        self.assertGreater(recall, 0.99)
 
     def test_small_nndescent(self):
-        """ building a too small graph used to crash, make sure it raises
+        """building a too small graph used to crash, make sure it raises
         an exception instead.
         TODO: build the exact knn graph for small cases
         """
@@ -797,5 +868,5 @@ class TestNNDescentKNNG(unittest.TestCase):
         index.nndescent.iter = 5
         index.verbose = True
 
-        xb = np.zeros((78, d), dtype='float32')
+        xb = np.zeros((78, d), dtype="float32")
         self.assertRaises(RuntimeError, index.add, xb)

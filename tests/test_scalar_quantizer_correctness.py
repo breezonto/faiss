@@ -67,6 +67,43 @@ class TestScalarQuantizerEncodeDecode(unittest.TestCase):
         faiss.normalize_L2(self.xb)
         self.do_encode_decode(faiss.ScalarQuantizer.QT_8bit_tqmse, 0.1)
 
+    def test_tqmse_preserves_norm(self):
+        """tqmse encodes unit-norm vectors with no per-vector scale factor in
+        the code, so reconstructions must keep unit norm. The Lloyd-Max table
+        is optimal for unit *variance*, so it only lines up with unit-norm
+        input once scaled by 1/sqrt(d) -- without that, every component lands
+        in the innermost cells and the codebook collapses toward a sign
+        quantizer, inflating norms by 15% at d=64 and 258% at d=768."""
+        for qtype, nbits in (
+            (faiss.ScalarQuantizer.QT_1bit_tqmse, 1),
+            (faiss.ScalarQuantizer.QT_2bit_tqmse, 2),
+            (faiss.ScalarQuantizer.QT_3bit_tqmse, 3),
+            (faiss.ScalarQuantizer.QT_4bit_tqmse, 4),
+            (faiss.ScalarQuantizer.QT_8bit_tqmse, 8),
+        ):
+            for d in (32, 64, 768):
+                with self.subTest(nbits=nbits, d=d):
+                    rs = np.random.RandomState(123)
+                    x = rs.randn(200, d).astype("float32")
+                    faiss.normalize_L2(x)
+
+                    sq = faiss.ScalarQuantizer(d, qtype)
+                    sq.train(x)
+                    decoded = sq.decode(sq.compute_codes(x))
+                    norms = np.linalg.norm(decoded, axis=1)
+
+                    # 1-bit cannot resolve magnitude at all (every component
+                    # reconstructs to +/-c), so it gets a looser band.
+                    tol = 0.25 if nbits == 1 else 0.1
+                    self.assertLess(abs(np.median(norms) - 1.0), tol)
+
+                    # Guard the collapse directly: a codebook matched to the
+                    # data reconstructs most of its 2^nbits distinct levels.
+                    # This is what catches 8-bit, whose norm stays near 1 even
+                    # when collapsed (31 of 256 levels used at d=768).
+                    used = len(np.unique(decoded))
+                    self.assertGreaterEqual(used, 2**nbits // 2)
+
     def test_codes_match_none(self):
         """SQ codes are integer; encode dispatch (sq-dispatch.h) must
         produce bit-identical output at every SIMD level. Catches drift in
@@ -74,11 +111,12 @@ class TestScalarQuantizerEncodeDecode(unittest.TestCase):
         if not faiss.SIMDConfig.is_simd_level_available(faiss.SIMDLevel_NONE):
             self.skipTest("SIMDLevel.NONE not available")
         for qtype in (
-                faiss.ScalarQuantizer.QT_8bit,
-                faiss.ScalarQuantizer.QT_4bit,
-                faiss.ScalarQuantizer.QT_8bit_uniform,
-                faiss.ScalarQuantizer.QT_4bit_uniform,
-                faiss.ScalarQuantizer.QT_fp16):
+            faiss.ScalarQuantizer.QT_8bit,
+            faiss.ScalarQuantizer.QT_4bit,
+            faiss.ScalarQuantizer.QT_8bit_uniform,
+            faiss.ScalarQuantizer.QT_4bit_uniform,
+            faiss.ScalarQuantizer.QT_fp16,
+        ):
             with self.subTest(qtype=qtype):
                 sq = faiss.ScalarQuantizer(self.d, qtype)
                 sq.train(self.xb)
@@ -115,10 +153,10 @@ class TestScalarQuantizerSearch(unittest.TestCase):
         self.assertGreater(recall, min_recall)
 
     def test_SQ4(self):
-        self.do_search('SQ4', 0.5)
+        self.do_search("SQ4", 0.5)
 
     def test_SQfp16(self):
-        self.do_search('SQfp16', 0.99)
+        self.do_search("SQfp16", 0.99)
 
     def test_tqmse_search(self):
         index_gt = faiss.IndexFlatL2(self.d)
@@ -126,17 +164,17 @@ class TestScalarQuantizerSearch(unittest.TestCase):
         _, I_gt = index_gt.search(self.xq_unit, 10)
 
         recalls = {}
-        for factory_str in ['L2norm,RR,SQtqmse4', 'L2norm,RR,SQtqmse8']:
+        for factory_str in ["L2norm,RR,SQtqmse4", "L2norm,RR,SQtqmse8"]:
             index = faiss.index_factory(self.d, factory_str)
             index.train(self.xb)
             index.add(self.xb)
             _, I = index.search(self.xq, 10)
             recalls[factory_str] = (I_gt[:, 0] == I[:, 0]).mean()
 
-        self.assertGreater(recalls['L2norm,RR,SQtqmse4'], 0.2)
+        self.assertGreater(recalls["L2norm,RR,SQtqmse4"], 0.2)
         self.assertGreaterEqual(
-            recalls['L2norm,RR,SQtqmse8'],
-            recalls['L2norm,RR,SQtqmse4'])
+            recalls["L2norm,RR,SQtqmse8"], recalls["L2norm,RR,SQtqmse4"]
+        )
 
 
 @for_all_simd_levels
@@ -148,7 +186,7 @@ class TestScalarQuantizerDistances(unittest.TestCase):
         x = ds.get_queries()
         xb = ds.get_database()
 
-        index = faiss.index_factory(d, 'SQ8')
+        index = faiss.index_factory(d, "SQ8")
         index.train(xb)
         index.add(xb)
 
@@ -167,7 +205,7 @@ class TestScalarQuantizerDistances(unittest.TestCase):
         faiss.normalize_L2(x)
         faiss.normalize_L2(xb)
 
-        index = faiss.index_factory(d, 'SQtqmse8')
+        index = faiss.index_factory(d, "SQtqmse8")
         index.train(xb)
         index.add(xb)
 
@@ -184,20 +222,20 @@ class TestScalarQuantizerEdgeCases(unittest.TestCase):
 
     def test_zero_vectors(self):
         d = 32
-        xb = np.zeros((100, d), dtype='float32')
-        index = faiss.index_factory(d, 'SQ8')
+        xb = np.zeros((100, d), dtype="float32")
+        index = faiss.index_factory(d, "SQ8")
         index.train(xb)
         index.add(xb)
-        D, _ = index.search(np.zeros((1, d), dtype='float32'), 10)
+        D, _ = index.search(np.zeros((1, d), dtype="float32"), 10)
         self.assertTrue(np.allclose(D, 0, atol=1e-5))
 
     def test_constant_vectors(self):
         d = 32
-        xb = np.ones((100, d), dtype='float32') * 0.5
-        index = faiss.index_factory(d, 'SQ8')
+        xb = np.ones((100, d), dtype="float32") * 0.5
+        index = faiss.index_factory(d, "SQ8")
         index.train(xb)
         index.add(xb)
-        D, _ = index.search(np.ones((1, d), dtype='float32') * 0.5, 10)
+        D, _ = index.search(np.ones((1, d), dtype="float32") * 0.5, 10)
         self.assertTrue(np.allclose(D, 0, atol=1e-3))
 
     def test_extreme_dims(self):
@@ -207,7 +245,7 @@ class TestScalarQuantizerEdgeCases(unittest.TestCase):
                 ds = SyntheticDataset(d=d, nt=0, nb=100, nq=10, seed=42)
                 xb = ds.get_database()
                 xq = ds.get_queries()
-                index = faiss.index_factory(d, 'SQ8')
+                index = faiss.index_factory(d, "SQ8")
                 index.train(xb)
                 index.add(xb)
                 D, I = index.search(xq, 10)
@@ -221,7 +259,7 @@ class TestScalarQuantizerEdgeCases(unittest.TestCase):
                 ds = SyntheticDataset(d=d, nt=0, nb=100, nq=5, seed=42)
                 xb = ds.get_database()
                 xq = ds.get_queries()
-                index = faiss.index_factory(d, 'SQ8')
+                index = faiss.index_factory(d, "SQ8")
                 index.train(xb)
                 index.add(xb)
                 D, I = index.search(xq, 10)
@@ -230,11 +268,11 @@ class TestScalarQuantizerEdgeCases(unittest.TestCase):
 
     def test_tqmse_non_simd_dims(self):
         factory_strings = [
-            'SQtqmse1',
-            'SQtqmse2',
-            'SQtqmse3',
-            'SQtqmse4',
-            'SQtqmse8',
+            "SQtqmse1",
+            "SQtqmse2",
+            "SQtqmse3",
+            "SQtqmse4",
+            "SQtqmse8",
         ]
         for d in [7, 9, 15, 17, 31, 33, 63, 65]:
             for factory_str in factory_strings:
@@ -263,7 +301,7 @@ class TestScalarQuantizerIP(unittest.TestCase):
         faiss.normalize_L2(xb)
         faiss.normalize_L2(xq)
 
-        index = faiss.index_factory(d, 'SQ8', faiss.METRIC_INNER_PRODUCT)
+        index = faiss.index_factory(d, "SQ8", faiss.METRIC_INNER_PRODUCT)
         index.train(xb)
         index.add(xb)
         D, _ = index.search(xq, 10)
@@ -284,7 +322,7 @@ class TestTurboQUnbiasedness(unittest.TestCase):
 
         for d in [128, 256, 384, 512, 768]:
             n = 500
-            xb = rng.randn(n, d).astype('float32')
+            xb = rng.randn(n, d).astype("float32")
             faiss.normalize_L2(xb)
 
             for qt_name, qt in [
@@ -303,10 +341,9 @@ class TestTurboQUnbiasedness(unittest.TestCase):
 
                 # Cosine similarity
                 xr_norms = np.linalg.norm(xr, axis=1)
-                cos_sim = np.array([
-                    xb[i] @ xr[i] / (xr_norms[i] + 1e-30)
-                    for i in range(n)
-                ]).mean()
+                cos_sim = np.array(
+                    [xb[i] @ xr[i] / (xr_norms[i] + 1e-30) for i in range(n)]
+                ).mean()
 
                 print(
                     f"{d:>6} {qt_name:>8} "
@@ -315,8 +352,9 @@ class TestTurboQUnbiasedness(unittest.TestCase):
 
                 # Reconstruction should point in the right direction
                 self.assertGreater(
-                    mean_self_ip, 0.1,
-                    msg=f"d={d} {qt_name}: self IP {mean_self_ip:.4f} too low"
+                    mean_self_ip,
+                    0.1,
+                    msg=f"d={d} {qt_name}: self IP {mean_self_ip:.4f} too low",
                 )
 
 
