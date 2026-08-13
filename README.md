@@ -5,3 +5,29 @@ This project is not maintained by the official Faiss team, and the maintainers a
 This repository retains all applicable copyright and license notices from the upstream project in accordance with the Apache License 2.0.
 
 ## Features from This Repo
+
+## Installation Guide
+
+Refers to [official guide](./INSTALL.md). Briefly, below are necessary dependencies for building targets _faiss_, _swigfaiss_ and _python package_:
+
+- OpenBLAS
+
+- Swig
+
+- gflags
+
+```
+sudo apt update
+sudo apt install libopenblas-dev # install openblas
+sudo apt install swig
+
+# inside the miniconda virtual environment, install gflags
+conda install -c conda forge gflags
+
+# if build with libuv
+conda install -c rapidsai -c conda-forge -c nvidia \
+    libcuvs=26.06 \
+    'cuda-version=13.0'
+```
+
+
