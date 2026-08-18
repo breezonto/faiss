@@ -30,4 +30,12 @@ conda install -c rapidsai -c conda-forge -c nvidia \
     'cuda-version=13.0'
 ```
 
+## Branch Management
+
+- **main**: local replication branch to the upstream's main branch
+
+- **develop**: the long-live active development branch (real Main branch of this project)
+
+- **fzb/devel**: the active branch for contribution to the upstream
+
 
